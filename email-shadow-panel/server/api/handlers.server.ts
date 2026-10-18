@@ -1,3 +1,10 @@
+import {
+  createInboxCreationDiagnostics,
+  observeCreation,
+  observeCreationSync,
+  type CreationEventSink,
+  type InboxCreationDiagnostics,
+} from "../diagnostics/inbox-creation.server.ts";
 import type { Clock } from "../session/clock.server.ts";
 import { messageReferenceSchema } from "../session/contracts.server.ts";
 import { DomainError } from "../session/errors.server.ts";
@@ -52,7 +59,7 @@ export interface PublicApiHandlers {
 
 export function createPublicApiHandlers(
   dependenciesFactory: () => PublicApiDependencies | Promise<PublicApiDependencies>,
-  options?: { requestIdGenerator?: () => string },
+  options?: { requestIdGenerator?: () => string; creationDiagnosticSink?: CreationEventSink },
 ): PublicApiHandlers {
   const requestIdGenerator = options?.requestIdGenerator ?? createRequestId;
 
@@ -79,11 +86,18 @@ export function createPublicApiHandlers(
     request: Request,
     route: string,
     allowedMethods: string[],
-    handler: (dependencies: PublicApiDependencies) => Promise<Response>,
+    handler: (
+      dependencies: PublicApiDependencies,
+      diagnostics?: InboxCreationDiagnostics,
+    ) => Promise<Response>,
   ): Promise<Response> {
     const requestId = requestIdGenerator();
     const startedAtMs = Date.now();
     let dependencies: PublicApiDependencies | undefined;
+    const diagnostics =
+      route === "inboxes" && request.method === "POST"
+        ? createInboxCreationDiagnostics(requestId, options?.creationDiagnosticSink)
+        : undefined;
 
     try {
       if (!allowedMethods.includes(request.method)) {
@@ -100,11 +114,18 @@ export function createPublicApiHandlers(
         return response;
       }
 
-      dependencies = await dependenciesFactory();
-      const response = await handler(dependencies);
+      dependencies = await observeCreation(
+        diagnostics,
+        "dependencies_initialized",
+        "create_inbox",
+        () => dependenciesFactory(),
+      );
+      const response = await handler(dependencies, diagnostics);
       await logRequest(dependencies, route, request, requestId, startedAtMs, response);
+      diagnostics?.finish(response.status);
       return response;
     } catch (error) {
+      diagnostics?.main("failure", error);
       const normalized = normalizePublicApiError(error, requestId);
       const response = createPublicErrorResponse(
         normalized.envelope,
@@ -120,6 +141,7 @@ export function createPublicApiHandlers(
         response,
         normalized.envelope.code,
       );
+      diagnostics?.finish(response.status, normalized.envelope.code, error);
       return response;
     }
   }
@@ -150,11 +172,14 @@ export function createPublicApiHandlers(
   async function handleCreateInbox(
     dependencies: PublicApiDependencies,
     request: Request,
+    diagnostics?: InboxCreationDiagnostics,
   ): Promise<Response> {
-    assertNoUnexpectedQuery(request);
-    assertSameOrigin(request);
-    await assertNoRequestBody(request);
-    requireProviderEnabled(dependencies);
+    await observeCreation(diagnostics, "request_validation", "create_inbox", async () => {
+      assertNoUnexpectedQuery(request);
+      assertSameOrigin(request);
+      await assertNoRequestBody(request);
+      requireProviderEnabled(dependencies);
+    });
 
     const visitorCookie = resolveAnonymousVisitorCookie(request, {
       name: dependencies.config.visitorCookieName,
@@ -164,24 +189,34 @@ export function createPublicApiHandlers(
     const visitorHash = dependencies.visitorHashService.hashVisitorIdentifier(visitorCookie.value);
     const { clientIpHash } = extractTrustedClientIpHash(request, dependencies.visitorHashService);
 
-    await enforceRateLimit(dependencies, {
-      scope: "create-visitor",
-      key: visitorHash,
-      limit: dependencies.config.createLimitPerVisitor,
-      windowMs: dependencies.config.createWindowMs,
-    });
-    await enforceRateLimit(dependencies, {
-      scope: "create-ip",
-      key: clientIpHash,
-      limit: dependencies.config.createLimitPerIp,
-      windowMs: dependencies.config.createWindowMs,
-    });
+    await observeCreation(diagnostics, "rate_limit_visitor", "create_inbox", () =>
+      enforceRateLimit(dependencies, {
+        scope: "create-visitor",
+        key: visitorHash,
+        limit: dependencies.config.createLimitPerVisitor,
+        windowMs: dependencies.config.createWindowMs,
+      }),
+    );
+    await observeCreation(diagnostics, "rate_limit_ip", "create_inbox", () =>
+      enforceRateLimit(dependencies, {
+        scope: "create-ip",
+        key: clientIpHash,
+        limit: dependencies.config.createLimitPerIp,
+        windowMs: dependencies.config.createWindowMs,
+      }),
+    );
 
-    const reservation = await dependencies.activeInboxLimiter.reserve({
-      anonymousVisitorHash: visitorHash,
-      limit: dependencies.config.maxActiveInboxesPerVisitor,
-      ttlMs: dependencies.config.activeInboxReservationTtlMs,
-    });
+    const reservation = await observeCreation(
+      diagnostics,
+      "active_slot_reservation",
+      "create_inbox",
+      () =>
+        dependencies.activeInboxLimiter.reserve({
+          anonymousVisitorHash: visitorHash,
+          limit: dependencies.config.maxActiveInboxesPerVisitor,
+          ttlMs: dependencies.config.activeInboxReservationTtlMs,
+        }),
+    );
     if (reservation.status === "limit_reached" || !reservation.reservationId) {
       throw new DomainError(
         "ACTIVE_INBOX_LIMIT_REACHED",
@@ -200,28 +235,45 @@ export function createPublicApiHandlers(
       const created = await dependencies.sessionService.createSession({
         visitorIdentifier: visitorCookie.value,
         signal: deadline.signal,
+        diagnostics,
       });
-      const responseBody = publicCreateInboxResponseSchema.parse({
-        data: {
-          capabilityToken: created.capabilityToken,
-          inbox: {
-            address: created.session.inboxAddress,
-            createdAt: created.session.createdAt,
-            updatedAt: created.session.updatedAt,
-            expiresAt: created.session.expiresAt,
-          },
+      const response = observeCreationSync(
+        diagnostics,
+        "public_response_prepare",
+        "create_inbox",
+        () => {
+          const responseBody = publicCreateInboxResponseSchema.parse({
+            data: {
+              capabilityToken: created.capabilityToken,
+              inbox: {
+                address: created.session.inboxAddress,
+                createdAt: created.session.createdAt,
+                updatedAt: created.session.updatedAt,
+                expiresAt: created.session.expiresAt,
+              },
+            },
+          });
+          const headers = visitorCookie.setCookieHeader
+            ? { "Set-Cookie": visitorCookie.setCookieHeader }
+            : undefined;
+          return createJsonResponse(responseBody, 201, headers);
         },
-      });
-      const headers = visitorCookie.setCookieHeader
-        ? { "Set-Cookie": visitorCookie.setCookieHeader }
-        : undefined;
-      return createJsonResponse(responseBody, 201, headers);
+      );
+      diagnostics?.main("success");
+      return response;
+    } catch (error) {
+      // Observe the original error before finally; do not change the escaping error.
+      diagnostics?.main("failure", error);
+      throw error;
     } finally {
       deadline.dispose();
-      await dependencies.activeInboxLimiter.release({
-        anonymousVisitorHash: visitorHash,
-        reservationId: reservation.reservationId,
-      });
+      // Intentionally retain the original masking behavior in this diagnostic candidate.
+      await observeCreation(diagnostics, "reservation_cleanup", "create_inbox", () =>
+        dependencies.activeInboxLimiter.release({
+          anonymousVisitorHash: visitorHash,
+          reservationId: reservation.reservationId!,
+        }),
+      );
     }
   }
 
@@ -412,13 +464,18 @@ export function createPublicApiHandlers(
       }
     },
     handleInboxesRoute(request: Request) {
-      return withRouteHandling(request, "inboxes", ["POST", "DELETE"], async (dependencies) => {
-        if (request.method === "POST") {
-          return handleCreateInbox(dependencies, request);
-        }
+      return withRouteHandling(
+        request,
+        "inboxes",
+        ["POST", "DELETE"],
+        async (dependencies, diagnostics) => {
+          if (request.method === "POST") {
+            return handleCreateInbox(dependencies, request, diagnostics);
+          }
 
-        return handleDeleteInbox(dependencies, request);
-      });
+          return handleDeleteInbox(dependencies, request);
+        },
+      );
     },
     handleMessagesRoute(request: Request) {
       return withRouteHandling(request, "messages", ["GET"], async (dependencies) => {

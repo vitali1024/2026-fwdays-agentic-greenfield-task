@@ -1,3 +1,8 @@
+import {
+  observeCreation,
+  observeCreationSync,
+  type InboxCreationDiagnostics,
+} from "../diagnostics/inbox-creation.server.ts";
 import { randomBytes } from "node:crypto";
 
 import { z } from "zod";
@@ -119,6 +124,7 @@ export class AnonymousSessionService {
   async createSession(input: {
     visitorIdentifier: string;
     signal?: AbortSignal;
+    diagnostics?: InboxCreationDiagnostics;
   }): Promise<CreateAnonymousSessionResult> {
     const parsed = createAnonymousSessionInputSchema.parse(input);
     const now = this.clock.now();
@@ -128,31 +134,46 @@ export class AnonymousSessionService {
 
     try {
       throwIfAborted(input.signal);
-      const createdInbox = await this.provider.createInbox({ signal: input.signal });
-      throwIfAborted(input.signal);
-      const state = createEmptyAnonymousSessionState(
-        emailnatorProviderStateSchema.parse(createdInbox.providerState),
+      const createdInbox = await observeCreation(
+        input.diagnostics,
+        "provider_create",
+        "create_inbox",
+        () => this.provider.createInbox({ signal: input.signal, diagnostics: input.diagnostics }),
       );
-      const encryptedSessionState = this.encryption.encrypt(state);
-      const persistedSession = persistedAnonymousSessionSchema.parse({
-        schemaVersion: 1,
-        sessionId: createSessionId(this.randomBytesImpl),
-        capabilityTokenHash,
-        anonymousVisitorHash: visitorHash,
-        inboxAddress: createdInbox.address,
-        encryptedSessionState,
-        providerStateVersion: 1,
-        providerId: this.provider.providerId,
-        createdAt: now.toISOString(),
-        updatedAt: now.toISOString(),
-        expiresAt: new Date(now.getTime() + this.sessionTtlMs).toISOString(),
-      });
-
-      await this.repository.create(persistedSession, this.sessionTtlMs);
-      return createAnonymousSessionResultSchema.parse({
-        capabilityToken,
-        session: buildSessionSummary(persistedSession),
-      });
+      throwIfAborted(input.signal);
+      const persistedSession = observeCreationSync(
+        input.diagnostics,
+        "session_prepare",
+        "create_inbox",
+        () => {
+          const state = createEmptyAnonymousSessionState(
+            emailnatorProviderStateSchema.parse(createdInbox.providerState),
+          );
+          const encryptedSessionState = this.encryption.encrypt(state);
+          return persistedAnonymousSessionSchema.parse({
+            schemaVersion: 1,
+            sessionId: createSessionId(this.randomBytesImpl),
+            capabilityTokenHash,
+            anonymousVisitorHash: visitorHash,
+            inboxAddress: createdInbox.address,
+            encryptedSessionState,
+            providerStateVersion: 1,
+            providerId: this.provider.providerId,
+            createdAt: now.toISOString(),
+            updatedAt: now.toISOString(),
+            expiresAt: new Date(now.getTime() + this.sessionTtlMs).toISOString(),
+          });
+        },
+      );
+      await observeCreation(input.diagnostics, "session_persist", "create_inbox", () =>
+        this.repository.create(persistedSession, this.sessionTtlMs),
+      );
+      return observeCreationSync(input.diagnostics, "session_result", "create_inbox", () =>
+        createAnonymousSessionResultSchema.parse({
+          capabilityToken,
+          session: buildSessionSummary(persistedSession),
+        }),
+      );
     } catch (error) {
       throw ensureDomainError(error, {
         code: "PERSISTENCE_UNAVAILABLE",

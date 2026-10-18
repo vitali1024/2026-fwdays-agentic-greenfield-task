@@ -1,3 +1,9 @@
+import {
+  observeCreation,
+  observeCreationSync,
+  type InboxCreationDiagnostics,
+  type CreationOperation,
+} from "../../diagnostics/inbox-creation.server.ts";
 import { CookieJar } from "tough-cookie";
 import { z } from "zod";
 
@@ -206,96 +212,135 @@ async function performRequest(
     signal?: AbortSignal;
   },
   runtime?: EmailnatorRuntime,
-): Promise<{
-  body: string;
-  contentType: string;
-  state: EmailnatorProviderState;
-}> {
-  const fetchImpl = getFetch(runtime);
-  const url = createProviderUrl(pathname);
-  const jar = deserializeCookieJar(state.cookieJar);
-  const method = options.method ?? "GET";
-  const timeoutMs = options.timeoutMs ?? EMAILNATOR_DEFAULT_TIMEOUT_MS;
-  const maxBytes = options.maxBytes ?? EMAILNATOR_MAX_RESPONSE_BYTES;
-  const headers = new Headers({
-    Accept: options.accept,
-    "X-Requested-With": "XMLHttpRequest",
+  diagnostics?: InboxCreationDiagnostics,
+  operation: CreationOperation = "bootstrap_get",
+): Promise<{ body: string; contentType: string; state: EmailnatorProviderState }> {
+  const { fetchImpl, url, jar, method, timeoutMs, maxBytes, headers } = observeCreationSync(
+    diagnostics,
+    "provider_request_prepare",
+    operation,
+    () => {
+      const fetchImpl = getFetch(runtime);
+      const url = createProviderUrl(pathname);
+      const jar = deserializeCookieJar(state.cookieJar);
+      const method = options.method ?? "GET";
+      const timeoutMs = options.timeoutMs ?? EMAILNATOR_DEFAULT_TIMEOUT_MS;
+      const maxBytes = options.maxBytes ?? EMAILNATOR_MAX_RESPONSE_BYTES;
+      const headers = new Headers({
+        Accept: options.accept,
+        "X-Requested-With": "XMLHttpRequest",
+      });
+      if (method === "POST") headers.set("Content-Type", "application/json");
+      return { fetchImpl, url, jar, method, timeoutMs, maxBytes, headers };
+    },
+  );
+
+  await observeCreation(diagnostics, "provider_cookie_xsrf", operation, async () => {
+    const cookieHeader = await buildCookieHeader(jar, url);
+    if (cookieHeader) headers.set("Cookie", cookieHeader);
+    const xsrfToken = await extractXsrfToken(jar, url, state.xsrfCookieName);
+    if (xsrfToken) headers.set(state.xsrfHeaderName, xsrfToken);
   });
-
-  if (method === "POST") {
-    headers.set("Content-Type", "application/json");
-  }
-
-  const cookieHeader = await buildCookieHeader(jar, url);
-  if (cookieHeader) {
-    headers.set("Cookie", cookieHeader);
-  }
-
-  const xsrfToken = await extractXsrfToken(jar, url, state.xsrfCookieName);
-  if (xsrfToken) {
-    headers.set(state.xsrfHeaderName, xsrfToken);
-  }
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const externalSignal = options.signal;
     const externalAbortListener = () => controller.abort(externalSignal?.reason);
-
     if (externalSignal) {
-      if (externalSignal.aborted) {
-        controller.abort(externalSignal.reason);
-      } else {
-        externalSignal.addEventListener("abort", externalAbortListener, { once: true });
-      }
+      if (externalSignal.aborted) controller.abort(externalSignal.reason);
+      else externalSignal.addEventListener("abort", externalAbortListener, { once: true });
     }
 
     try {
-      const response = await fetchImpl(url, {
+      const init = observeCreationSync(diagnostics, "provider_request_prepare", operation, () => ({
         method,
         body: options.jsonBody ? JSON.stringify(options.jsonBody) : undefined,
         headers,
-        redirect: "manual",
+        redirect: "manual" as const,
         signal: controller.signal,
-      });
+      }));
+      // Only fetch is observed as network work. Parsing/cookie errors have separate stages.
+      const response = await observeCreation(diagnostics, "provider_network", operation, () =>
+        fetchImpl(url, init),
+      );
+      const received = { httpStatus: response.status };
+      diagnostics?.emit("provider_http_response", "success", operation, received);
+      await observeCreation(
+        diagnostics,
+        "provider_response_cookies",
+        operation,
+        () => applyResponseCookies(jar, response.headers, url),
+        received,
+      );
+      const { body, contentType } = await observeCreation(
+        diagnostics,
+        "provider_response_read",
+        operation,
+        async () => {
+          const body = await readResponseText(response, maxBytes);
+          const contentType = response.headers.get("content-type") ?? "application/octet-stream";
+          return { body, contentType };
+        },
+        received,
+      );
 
-      await applyResponseCookies(jar, response.headers, url);
-      const body = await readResponseText(response, maxBytes);
-      const contentType = response.headers.get("content-type") ?? "application/octet-stream";
-
-      if (!response.ok) {
-        throw normalizeProviderHttpError(response.status, body);
-      }
-
-      if (isChallengeBody(body)) {
-        throw new EmailnatorError(
-          "PROVIDER_BLOCKED",
-          "The provider returned a challenge or blocking response.",
-          { status: 502 },
-        );
-      }
+      observeCreationSync(
+        diagnostics,
+        "provider_http_validate",
+        operation,
+        () => {
+          if (!response.ok) {
+            const error = normalizeProviderHttpError(response.status, body);
+            if (error.code === "PROVIDER_BLOCKED")
+              diagnostics?.emit("provider_challenge_check", "failure", operation, {
+                ...received,
+                error,
+              });
+            throw error;
+          }
+        },
+        received,
+      );
+      observeCreationSync(
+        diagnostics,
+        "provider_challenge_check",
+        operation,
+        () => {
+          if (isChallengeBody(body)) {
+            throw new EmailnatorError(
+              "PROVIDER_BLOCKED",
+              "The provider returned a challenge or blocking response.",
+              { status: 502 },
+            );
+          }
+        },
+        received,
+      );
 
       return {
         body,
         contentType,
-        state: await persistState(state, jar, runtime),
+        state: await observeCreation(
+          diagnostics,
+          "provider_state_process",
+          operation,
+          () => persistState(state, jar, runtime),
+          received,
+        ),
       };
     } catch (error) {
       if (attempt === 0 && shouldRetryNetworkError(error)) {
+        diagnostics?.emit("provider_retry", "start", operation, { error });
         continue;
       }
-
-      if (error instanceof EmailnatorError) {
-        throw error;
-      }
-
+      if (error instanceof EmailnatorError) throw error;
       if (error instanceof DOMException && error.name === "AbortError") {
         throw new EmailnatorError("REQUEST_TIMEOUT", "The provider request timed out.", {
           cause: error,
           status: 504,
         });
       }
-
       throw new EmailnatorError("PROVIDER_HTTP", "The provider request failed.", {
         cause: error,
         status: 502,
@@ -305,7 +350,6 @@ async function performRequest(
       externalSignal?.removeEventListener("abort", externalAbortListener);
     }
   }
-
   throw new EmailnatorError("PROVIDER_HTTP", "The provider request failed.", { status: 502 });
 }
 
@@ -378,8 +422,14 @@ export async function bootstrapProviderSession(
   inputState?: EmailnatorProviderState,
   runtime?: EmailnatorRuntime,
   signal?: AbortSignal,
+  diagnostics?: InboxCreationDiagnostics,
 ): Promise<EmailnatorProviderState> {
-  const state = inputState ?? createEmptyProviderState();
+  const state = observeCreationSync(
+    diagnostics,
+    "provider_state_process",
+    "bootstrap_get",
+    () => inputState ?? createEmptyProviderState(),
+  );
   const result = await performRequest(
     state,
     EMAILNATOR_BOOTSTRAP_PATH,
@@ -389,16 +439,22 @@ export async function bootstrapProviderSession(
       signal,
     },
     runtime,
+    diagnostics,
+    "bootstrap_get",
   );
 
-  parseWithSchema(bootstrapHtmlSchema, result.body, "Bootstrap HTML");
-  return parseWithSchema(
-    emailnatorProviderStateSchema,
-    {
-      ...result.state,
-      lastBootstrapAt: getNow(runtime).toISOString(),
-    },
-    "Bootstrapped provider state",
+  observeCreationSync(diagnostics, "bootstrap_html_validate", "bootstrap_get", () =>
+    parseWithSchema(bootstrapHtmlSchema, result.body, "Bootstrap HTML"),
+  );
+  return observeCreationSync(diagnostics, "provider_state_process", "bootstrap_get", () =>
+    parseWithSchema(
+      emailnatorProviderStateSchema,
+      {
+        ...result.state,
+        lastBootstrapAt: getNow(runtime).toISOString(),
+      },
+      "Bootstrapped provider state",
+    ),
   );
 }
 
@@ -432,62 +488,77 @@ async function requestGeneratedInboxAddress(
   mode: EmailnatorGenerationMode,
   runtime?: EmailnatorRuntime,
   signal?: AbortSignal,
+  diagnostics?: InboxCreationDiagnostics,
+  operation: CreationOperation = "generate_primary_post",
 ): Promise<{ address: string | null; state: EmailnatorProviderState }> {
+  const requestOptions = observeCreationSync(diagnostics, "generation_prepare", operation, () => ({
+    accept: "application/json, text/plain, */*",
+    method: "POST" as const,
+    jsonBody: {
+      email: [mode],
+    },
+    signal,
+  }));
   const result = await performRequest(
     state,
     EMAILNATOR_GENERATE_PATH,
-    {
-      accept: "application/json, text/plain, */*",
-      method: "POST",
-      jsonBody: {
-        email: [mode],
-      },
-      signal,
-    },
+    requestOptions,
     runtime,
+    diagnostics,
+    operation,
   );
 
-  const parsed = parseWithSchema(
-    emailnatorGenerateResponseSchema,
-    parseJsonBody(result.body, "Generate response"),
-    "Generate response",
-  );
-  const addresses = Array.isArray(parsed.email) ? parsed.email : [parsed.email];
-  const address =
-    addresses.find((candidate) => isCompatibleGeneratedAddress(candidate, mode)) ?? null;
+  return observeCreationSync(diagnostics, "generation_response_validate", operation, () => {
+    const parsed = parseWithSchema(
+      emailnatorGenerateResponseSchema,
+      parseJsonBody(result.body, "Generate response"),
+      "Generate response",
+    );
+    const addresses = Array.isArray(parsed.email) ? parsed.email : [parsed.email];
+    const address =
+      addresses.find((candidate) => isCompatibleGeneratedAddress(candidate, mode)) ?? null;
 
-  return {
-    address,
-    state: parseWithSchema(
-      emailnatorProviderStateSchema,
-      address
-        ? {
-            ...result.state,
-            address,
-          }
-        : result.state,
-      "Generated provider state",
-    ),
-  };
+    return {
+      address,
+      state: parseWithSchema(
+        emailnatorProviderStateSchema,
+        address
+          ? {
+              ...result.state,
+              address,
+            }
+          : result.state,
+        "Generated provider state",
+      ),
+    };
+  });
 }
 
 export async function generateInboxAddress(
   runtime?: EmailnatorRuntime,
   signal?: AbortSignal,
+  diagnostics?: InboxCreationDiagnostics,
 ): Promise<GeneratedInboxResult> {
-  const bootstrapped = await bootstrapProviderSession(undefined, runtime, signal);
+  const bootstrapped = await bootstrapProviderSession(undefined, runtime, signal, diagnostics);
   const primaryAttempt = await requestGeneratedInboxAddress(
     bootstrapped,
     EMAILNATOR_DEFAULT_GENERATION_MODE,
     runtime,
     signal,
+    diagnostics,
+    "generate_primary_post",
   );
 
   if (primaryAttempt.address) {
     return {
       address: primaryAttempt.address,
       state: primaryAttempt.state,
-      diagnostics: await redactStateDiagnostics(primaryAttempt.state),
+      diagnostics: await observeCreation(
+        diagnostics,
+        "provider_state_process",
+        "generate_primary_post",
+        () => redactStateDiagnostics(primaryAttempt.state),
+      ),
     };
   }
 
@@ -496,20 +567,34 @@ export async function generateInboxAddress(
     EMAILNATOR_FALLBACK_GENERATION_MODE,
     runtime,
     signal,
+    diagnostics,
+    "generate_fallback_post",
   );
 
   if (fallbackAttempt.address) {
     return {
       address: fallbackAttempt.address,
       state: fallbackAttempt.state,
-      diagnostics: await redactStateDiagnostics(fallbackAttempt.state),
+      diagnostics: await observeCreation(
+        diagnostics,
+        "provider_state_process",
+        "generate_fallback_post",
+        () => redactStateDiagnostics(fallbackAttempt.state),
+      ),
     };
   }
 
-  throw new EmailnatorError(
-    "PROVIDER_RESPONSE_INVALID",
-    "The provider did not return a Gmail-style inbox address compatible with the MVP.",
-    { status: 502 },
+  return observeCreationSync(
+    diagnostics,
+    "generation_address_compatibility",
+    "generate_fallback_post",
+    () => {
+      throw new EmailnatorError(
+        "PROVIDER_RESPONSE_INVALID",
+        "The provider did not return a Gmail-style inbox address compatible with the MVP.",
+        { status: 502 },
+      );
+    },
   );
 }
 

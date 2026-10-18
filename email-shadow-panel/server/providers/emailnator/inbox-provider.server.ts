@@ -60,13 +60,17 @@ export function createEmailnatorInboxProvider(
     providerId: "emailnator",
     async createInbox(input) {
       try {
-        const result = await generateInboxAddress(runtime, input?.signal);
+        const result = await generateInboxAddress(runtime, input?.signal, input?.diagnostics);
         return {
           address: result.address,
           providerState: result.state,
         };
       } catch (error) {
-        throw normalizeEmailnatorError(error);
+        const normalized = normalizeEmailnatorError(error);
+        input?.diagnostics?.emit("provider_classification", "failure", "create_inbox", {
+          error: normalized,
+        });
+        throw normalized;
       }
     },
     async listMessages({ providerState, signal }) {

@@ -1,3 +1,5 @@
+import type { InboxCreationDiagnostics } from "../diagnostics/inbox-creation.server.ts";
+
 export interface ProviderInboxMessageSummary {
   providerMessageId: string;
   from: string;
@@ -33,7 +35,10 @@ export interface GetInboxMessageDetailResult<TProviderState> {
 export interface InboxProvider<TProviderState> {
   readonly providerId: string;
 
-  createInbox(input?: { signal?: AbortSignal }): Promise<CreateInboxResult<TProviderState>>;
+  createInbox(input?: {
+    signal?: AbortSignal;
+    diagnostics?: InboxCreationDiagnostics;
+  }): Promise<CreateInboxResult<TProviderState>>;
 
   listMessages(input: {
     providerState: TProviderState;
